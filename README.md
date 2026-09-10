@@ -48,7 +48,7 @@ color =)` — deaths are read from the step drops and censoring times from the
 needed. This requires the censor ticks to be visible on the figure; without
 them, prefer asking the data owner for the at-risk table. In our validation
 this mode recovered a 20-patient curve's median within 0.1 months and its
-event count exactly.
+event count exactly (internal validation on a real oncology figure).
 
 Self-contained validation: `Rscript example/synthetic_test.R` simulates a
 dataset, draws its KM to PNG, re-extracts it from the image and compares with
@@ -56,14 +56,32 @@ the known truth (median recovered within 0.01 months in the shipped example).
 
 ## Accuracy, from our validation
 
-- Unobstructed curves: medians recovered within 0.0–0.4 months of published
-  values; event counts exact; at-risk anchors honored exactly by construction.
+What the tool actually reconstructs well is the **survival path**: in our
+synthetic round-trip tests (`example/`), the maximum deviation of the
+reconstructed KM curve was 0.02–0.05 in survival probability, event counts
+were exact, and at-risk anchors are honored exactly by construction. A
+synthetic two-arm test recovered the Cox HR within 0.2%.
+
+Point statistics derived from the path behave accordingly:
+
+- **Medians** are usually recovered within ~0.4 months, *but* the median is a
+  discontinuous functional: when the true curve grazes 0.5 (e.g. a step to
+  S = 0.503), a near-perfect reconstruction can still land the median on the
+  adjacent event time (we observed a 1.6-month jump on such a knife-edge
+  case, with a path error of only 0.005 at the crossing). Always cross-check
+  reconstructed medians against the published ones before use.
 - Overlaid curves: steps hidden under another curve near the median crossing
-  can shift the reconstructed median by up to ~1 month; downstream two-arm HRs
-  moved by <3% in our sensitivity checks.
+  can shift the reconstructed median by ~1 month.
 - Reconstructed **median confidence intervals are unreliable** (discrete-jump
   statistic) — use the reconstruction for HR-type analyses, quote medians/CIs
   from the original publication.
+- **Anchor-free mode**: each censor tick missed by the detector (overlapping
+  ticks merge; low resolution hides them) becomes a spurious death. The
+  function reports the detected tick count — verify it against the figure.
+
+Run the shipped validation: `Rscript example/synthetic_test.R` and
+`Rscript example/adversarial_tests.R` (heavy censoring, curve-to-zero,
+N = 150, anchor-free round trips).
 
 ## Caveats
 

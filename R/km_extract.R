@@ -7,9 +7,14 @@
 #
 # Main entry point:
 #   km_extract(image_path, x_ticks, anchors, ...)
-# returns list(ipd, lifetable, curve) — see README for arguments and examples.
+# returns list(ipd, lifetable, curve, fit) — see README for arguments and examples.
 #
 # Requires: png (and/or jpeg), survival.
+#
+# Pixel-geometry constants (tick-label grouping 15px, drop-vs-line threshold
+# 8px, reappearance jump cap 150px, tick bands ~25px) are tuned for figures
+# roughly 700-2000px wide; validated down to 450x300. Below that, expect loud
+# failures (tick-count mismatch), not silent ones.
 
 .km_read_image <- function(path) {
   ext <- tolower(tools::file_ext(path))
@@ -19,11 +24,14 @@
     jpeg = jpeg::readJPEG(path),
     stop("Unsupported image format '", ext, "' (use png or jpeg; export PDFs to PNG first)"))
   if (length(dim(img)) == 2) img <- array(rep(img, 3), dim = c(dim(img), 3))
+  if (dim(img)[3] == 2) img <- array(rep(img[, , 1], 3), dim = c(dim(img)[1:2], 3))  # gray+alpha
   img[, , 1:3, drop = FALSE]
 }
 
 .km_find_axes <- function(g, dark_thresh) {
   dark <- g < dark_thresh
+  if (!any(dark)) stop("no dark pixels found - could not detect plot axes ",
+                       "(is this a plot image? try raising dark_thresh)")
   h <- nrow(g); w <- ncol(g)
   longest_run <- function(v) {
     if (!any(v)) return(0L)
@@ -116,7 +124,24 @@
   list(x = xs[keep], y = ys[keep], h = hh[keep], last_seen = last_seen)
 }
 
-.km_reconstruct <- function(steps, anchors, t_end) {
+
+.km_censor_ticks <- function(tr, t, S, min_drop) {
+  thick <- stats::median(tr$h[tr$h > 0])
+  if (is.na(thick)) return(numeric(0))
+  flat_at <- function(k) {
+    lo <- max(1L, k - 8L); hi <- min(length(S), k + 8L)
+    (S[lo] - S[hi]) < min_drop / 2
+  }
+  cand <- which(tr$h >= thick + 5L & vapply(seq_along(tr$h), flat_at, TRUE))
+  out <- numeric(0)
+  if (length(cand)) {
+    b <- cumsum(c(1L, diff(cand) > 3L))
+    for (grp in split(cand, b)) out <- c(out, t[as.integer(round(mean(grp)))])
+  }
+  out
+}
+
+.km_reconstruct <- function(steps, anchors, t_end, cens_hint = numeric(0)) {
   ipd_t <- numeric(0); ipd_e <- integer(0)
   S_prev <- 1
   for (k in seq_len(nrow(anchors) - 1L)) {
@@ -125,35 +150,75 @@
     D <- E1 - E0; C <- (n0 - n1) - D
     stopifnot("inconsistent anchors (D<0 or C<0)" = D >= 0 && C >= 0)
     seg <- steps[steps$t >= t0 & steps$t < t1, , drop = FALSE]
-    n <- n0; Sp <- S_prev
-    d <- integer(nrow(seg))
-    if (nrow(seg)) for (i in seq_len(nrow(seg))) {
-      d[i] <- if (Sp > 0) max(0L, as.integer(round(n * (1 - seg$S[i] / Sp)))) else 0L
-      n <- n - d[i]; Sp <- seg$S[i]
+    if (!nrow(seg) && D > 0L) seg <- data.frame(t = (t0 + t1) / 2, S = NA)
+    ct <- numeric(0)
+    if (C > 0L) {
+      hints <- cens_hint[cens_hint >= t0 & cens_hint < t1]
+      if (length(hints) >= C) {
+        ct <- hints[as.integer(round(seq(1, length(hints), length.out = C)))]
+      } else {
+        fill <- C - length(hints)
+        ct <- sort(c(hints, t0 + (t1 - t0) * seq_len(fill) / (fill + 1)))
+      }
     }
+    # merged timeline: censorings interleaved into the risk-set updates (Guyot)
+    ev <- rbind(if (nrow(seg)) data.frame(t = seg$t, S = seg$S, type = "d"),
+                if (length(ct)) data.frame(t = ct, S = NA, type = "c"))
+    if (is.null(ev) || !nrow(ev)) next
+    ev <- ev[order(ev$t), , drop = FALSE]
+    alloc <- function(dv) {
+      # walk the merged timeline with death counts dv on the step rows;
+      # returns list(S_end, feasible)
+      n <- n0; Sp <- S_prev; j <- 0L
+      for (i in seq_len(nrow(ev))) {
+        if (ev$type[i] == "c") { n <- n - 1L }
+        else {
+          j <- j + 1L
+          if (dv[j] > n) return(list(S = NA, ok = FALSE))
+          if (n > 0L) Sp <- Sp * (1 - dv[j] / n)
+          n <- n - dv[j]
+        }
+      }
+      list(S = Sp, ok = TRUE)
+    }
+    is_step <- ev$type == "d"
+    m <- sum(is_step)
+    d <- integer(m)
+    # initial allocation from the observed drop ratios, with interleaved n
+    n <- n0; Sp <- S_prev; j <- 0L
+    for (i in seq_len(nrow(ev))) {
+      if (ev$type[i] == "c") { n <- n - 1L; next }
+      j <- j + 1L
+      d[j] <- if (!is.na(ev$S[i]) && Sp > 0) {
+        min(n, max(0L, as.integer(round(n * (1 - ev$S[i] / Sp)))))
+      } else 0L
+      if (n > 0L && d[j] > 0L) Sp <- Sp * (1 - d[j] / n)
+      n <- n - d[j]
+    }
+    # correct to the exact interval death total
     diff_d <- D - sum(d)
-    if (nrow(seg) && diff_d != 0L) {
+    if (m > 0L && diff_d != 0L) {
       ord <- order(d, decreasing = TRUE); i <- 0L; guard <- 0L
       while (diff_d != 0L) {
-        j <- ord[(i %% length(ord)) + 1L]
-        if (diff_d > 0L) { d[j] <- d[j] + 1L; diff_d <- diff_d - 1L }
-        else if (d[j] > 0L) { d[j] <- d[j] - 1L; diff_d <- diff_d + 1L }
+        j <- ord[(i %% m) + 1L]
+        if (diff_d > 0L) {
+          trial <- d; trial[j] <- trial[j] + 1L
+          if (alloc(trial)$ok) { d <- trial; diff_d <- diff_d - 1L }
+        } else if (d[j] > 0L) { d[j] <- d[j] - 1L; diff_d <- diff_d + 1L }
         i <- i + 1L; guard <- guard + 1L
         stopifnot("allocation loop stuck" = guard < 10000L)
       }
-    } else if (!nrow(seg) && D > 0L) {
-      seg <- data.frame(t = (t0 + t1) / 2, S = NA); d <- D
     }
-    if (nrow(seg)) for (i in seq_len(nrow(seg))) if (d[i] > 0L) {
-      ipd_t <- c(ipd_t, rep(seg$t[i], d[i])); ipd_e <- c(ipd_e, rep(1L, d[i]))
+    # emit IPD rows in timeline order
+    j <- 0L
+    for (i in seq_len(nrow(ev))) {
+      if (ev$type[i] == "c") { ipd_t <- c(ipd_t, ev$t[i]); ipd_e <- c(ipd_e, 0L) }
+      else {
+        j <- j + 1L
+        if (d[j] > 0L) { ipd_t <- c(ipd_t, rep(ev$t[i], d[j])); ipd_e <- c(ipd_e, rep(1L, d[j])) }
+      }
     }
-    if (C > 0L) {
-      ipd_t <- c(ipd_t, t0 + (t1 - t0) * seq_len(C) / (C + 1))
-      ipd_e <- c(ipd_e, rep(0L, C))
-    }
-    n <- n0; Sp <- S_prev
-    if (nrow(seg)) for (i in seq_len(nrow(seg))) { if (n > 0) Sp <- Sp * (1 - d[i] / n); n <- n - d[i] }
-    S_prev <- Sp
+    S_prev <- alloc(d)$S
   }
   nl <- anchors$n[nrow(anchors)]; tl <- anchors$t[nrow(anchors)]
   if (nl > 0L) { ipd_t <- c(ipd_t, rep(max(tl, t_end), nl)); ipd_e <- c(ipd_e, rep(0L, nl)) }
@@ -189,6 +254,11 @@ km_extract <- function(image_path, x_ticks, anchors, t_end,
                        color = NULL, seed = FALSE,
                        dark_thresh = 110/255, color_tol = 70/255) {
   stopifnot(all(c("t", "n", "E") %in% names(anchors)))
+  if (is.unsorted(anchors$t)) stop("anchors must be sorted by t")
+  if (anchors$E[1] != 0) stop("anchors must start with E = 0 (cumulative events)")
+  if (length(x_ticks) < 2) stop("need at least 2 x_ticks for calibration")
+  if (t_end < max(anchors$t[anchors$n > 0], 0))
+    stop("t_end must be >= the last anchor time with patients still at risk")
   img <- .km_read_image(image_path)
   g <- (img[, , 1] + img[, , 2] + img[, , 3]) / 3
   axes <- .km_find_axes(g, dark_thresh)
@@ -201,6 +271,8 @@ km_extract <- function(image_path, x_ticks, anchors, t_end,
   mask <- .km_curve_mask(img, color, dark_thresh, color_tol)
   y_top <- ticks$y_px[which.max(y_ticks)]
   tr <- .km_trace(mask, axes, y_top, seed)
+  if (!length(tr$x) || all(tr$h == 0))
+    stop("no curve pixels matched the mask - check `color` (and `seed` for overlaid curves)")
   fx <- lm(v ~ p, data = data.frame(p = ticks$x_px, v = x_ticks))
   fy <- lm(v ~ p, data = data.frame(p = ticks$y_px, v = y_ticks))
   t <- as.numeric(predict(fx, data.frame(p = tr$x)))
@@ -212,7 +284,9 @@ km_extract <- function(image_path, x_ticks, anchors, t_end,
   for (i in seq_along(t)[-1]) if (S_run - S[i] >= min_drop) {
     st_t <- c(st_t, t[i]); st_S <- c(st_S, S[i]); S_run <- S[i]
   }
-  ipd <- .km_reconstruct(data.frame(t = st_t, S = st_S), anchors, t_end)
+  cens_hint <- .km_censor_ticks(tr, t, S, min_drop)
+  ipd <- .km_reconstruct(data.frame(t = st_t, S = st_S), anchors, t_end,
+                         cens_hint = cens_hint)
   fit <- survival::survfit(survival::Surv(time, event) ~ 1, data = ipd)
   lifetable <- data.frame(time = fit$time, n.risk = fit$n.risk,
                           n.event = fit$n.event, n.censor = fit$n.censor)
@@ -244,6 +318,7 @@ km_extract_free <- function(image_path, x_ticks, N,
                             y_ticks = c(1, 0.75, 0.5, 0.25, 0),
                             color = NULL, seed = FALSE, t_end = NULL,
                             dark_thresh = 110/255, color_tol = 70/255) {
+  stopifnot(N >= 1, length(x_ticks) >= 2)
   img <- .km_read_image(image_path)
   g <- (img[, , 1] + img[, , 2] + img[, , 3]) / 3
   axes <- .km_find_axes(g, dark_thresh)
@@ -255,6 +330,8 @@ km_extract_free <- function(image_path, x_ticks, N,
   mask <- .km_curve_mask(img, color, dark_thresh, color_tol)
   y_top <- ticks$y_px[which.max(y_ticks)]
   tr <- .km_trace(mask, axes, y_top, seed)
+  if (!length(tr$x) || all(tr$h == 0))
+    stop("no curve pixels matched the mask - check `color` (and `seed` for overlaid curves)")
   fx <- lm(v ~ p, data = data.frame(p = ticks$x_px, v = x_ticks))
   fy <- lm(v ~ p, data = data.frame(p = ticks$y_px, v = y_ticks))
   t <- as.numeric(predict(fx, data.frame(p = tr$x)))
@@ -268,21 +345,17 @@ km_extract_free <- function(image_path, x_ticks, N,
     st_t <- c(st_t, t[i]); st_S <- c(st_S, S[i]); S_run <- S[i]
   }
   # censor ticks: tall runs on a locally flat stretch of the curve
-  thick <- stats::median(tr$h[tr$h > 0])
-  flat_at <- function(k) {
-    lo <- max(1L, k - 8L); hi <- min(length(S), k + 8L)
-    (S[lo] - S[hi]) < min_drop / 2
-  }
-  cand <- which(tr$h >= thick + 5L & vapply(seq_along(tr$h), flat_at, TRUE))
-  cens_t <- numeric(0)
-  if (length(cand)) {
-    b <- cumsum(c(1L, diff(cand) > 3L))
-    for (grp in split(cand, b)) cens_t <- c(cens_t, t[as.integer(round(mean(grp)))])
-  }
+  if (all(tr$h == 0)) stop("curve trace produced no measurable line - image too degraded?")
+  cens_t <- .km_censor_ticks(tr, t, S, min_drop)
   # sequential reconstruction: deaths from drop ratios, censors from ticks
+  if (!length(st_t) && !length(cens_t))
+    stop("no steps and no censor ticks detected - nothing to reconstruct")
   ev <- rbind(if (length(st_t)) data.frame(t = st_t, S = st_S, type = "d"),
               if (length(cens_t)) data.frame(t = cens_t, S = NA, type = "c"))
   ev <- ev[order(ev$t), ]
+  message(length(st_t), " step(s) and ", length(cens_t),
+          " censor tick(s) detected - verify the tick count against the figure: ",
+          "each missed tick can turn a censoring into a spurious death")
   n <- N; Sp <- 1
   ipd_t <- numeric(0); ipd_e <- integer(0)
   for (i in seq_len(nrow(ev))) {
