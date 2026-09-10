@@ -3,11 +3,6 @@
 Reconstruct pseudo individual-patient data (IPD) from a published Kaplan–Meier
 curve image (PNG/JPEG), constrained by the printed number-at-risk table.
 
-Two collaborating teams that cannot exchange patient-level data can each run
-this tool on the other's *published* KM figures, compute the joint statistics
-(e.g. a two-arm Cox HR) on their side, and cross-check results — no
-patient-level data ever crosses.
-
 ## Method
 
 1. Automated pixel extraction of the KM step function (axis/tick calibration,
