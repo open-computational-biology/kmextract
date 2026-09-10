@@ -59,11 +59,10 @@ synthetic two-arm test recovered the Cox HR within 0.2%.
 
 Point statistics derived from the path behave accordingly:
 
-- **Medians** are usually recovered within ~0.4 months, *but* the median is a
-  discontinuous functional: when the true curve grazes 0.5 (e.g. a step to
-  S = 0.503), a near-perfect reconstruction can still land the median on the
-  adjacent event time (we observed a 1.6-month jump on such a knife-edge
-  case, with a path error of only 0.005 at the crossing). Always cross-check
+- **Medians** were recovered within ~0.4 months in all our round-trip tests
+  (including a knife-edge case where the true curve grazes S = 0.503, solved
+  by the fit-to-trace refinement of the death/censoring allocation). Keep in
+  mind the median is a discontinuous functional — always cross-check
   reconstructed medians against the published ones before use.
 - Overlaid curves: steps hidden under another curve near the median crossing
   can shift the reconstructed median by ~1 month.

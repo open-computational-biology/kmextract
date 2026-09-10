@@ -151,74 +151,102 @@
     stopifnot("inconsistent anchors (D<0 or C<0)" = D >= 0 && C >= 0)
     seg <- steps[steps$t >= t0 & steps$t < t1, , drop = FALSE]
     if (!nrow(seg) && D > 0L) seg <- data.frame(t = (t0 + t1) / 2, S = NA)
-    ct <- numeric(0)
+    m <- nrow(seg)
+    if (m == 0L && C == 0L) next
+    # decision variables: d[j] deaths at step j; cg[g] censors in gap g,
+    # where gap g = 0..m lies before step g+1 (gap m = after the last step)
+    walk <- function(d, cg) {
+      # returns per-step reconstructed S and end-of-interval S, or NULL if infeasible
+      if (any(cg < 0L) || any(d < 0L)) return(NULL)
+      n <- n0 - cg[1L]
+      Sp <- S_prev; Ss <- numeric(m)
+      for (j in seq_len(m)) {
+        if (d[j] > n) return(NULL)
+        if (n > 0L) Sp <- Sp * (1 - d[j] / n)
+        Ss[j] <- Sp
+        n <- n - d[j] - cg[j + 1L]
+      }
+      if (n < 0L) return(NULL)
+      list(Ss = Ss, S_end = Sp)
+    }
+    err <- function(d, cg) {
+      w <- walk(d, cg)
+      if (is.null(w)) return(Inf)
+      ok <- !is.na(seg$S)
+      if (!any(ok)) return(0)
+      sum((w$Ss[ok] - seg$S[ok])^2)
+    }
+    # ---- initial allocation ----
+    gaps_lo <- c(t0, seg$t); gaps_hi <- c(seg$t, t1)
+    cg <- integer(m + 1L)
     if (C > 0L) {
       hints <- cens_hint[cens_hint >= t0 & cens_hint < t1]
-      if (length(hints) >= C) {
-        ct <- hints[as.integer(round(seq(1, length(hints), length.out = C)))]
-      } else {
-        fill <- C - length(hints)
-        ct <- sort(c(hints, t0 + (t1 - t0) * seq_len(fill) / (fill + 1)))
+      for (h in hints[seq_len(min(length(hints), C))]) {
+        g <- findInterval(h, c(t0, seg$t))          # 1..m+1
+        cg[g] <- cg[g] + 1L
+      }
+      left <- C - sum(cg)
+      if (left > 0L) {                               # spread remainder evenly
+        pos <- t0 + (t1 - t0) * seq_len(left) / (left + 1L)
+        for (h in pos) { g <- findInterval(h, c(t0, seg$t)); cg[g] <- cg[g] + 1L }
       }
     }
-    # merged timeline: censorings interleaved into the risk-set updates (Guyot)
-    ev <- rbind(if (nrow(seg)) data.frame(t = seg$t, S = seg$S, type = "d"),
-                if (length(ct)) data.frame(t = ct, S = NA, type = "c"))
-    if (is.null(ev) || !nrow(ev)) next
-    ev <- ev[order(ev$t), , drop = FALSE]
-    alloc <- function(dv) {
-      # walk the merged timeline with death counts dv on the step rows;
-      # returns list(S_end, feasible)
-      n <- n0; Sp <- S_prev; j <- 0L
-      for (i in seq_len(nrow(ev))) {
-        if (ev$type[i] == "c") { n <- n - 1L }
-        else {
-          j <- j + 1L
-          if (dv[j] > n) return(list(S = NA, ok = FALSE))
-          if (n > 0L) Sp <- Sp * (1 - dv[j] / n)
-          n <- n - dv[j]
-        }
-      }
-      list(S = Sp, ok = TRUE)
-    }
-    is_step <- ev$type == "d"
-    m <- sum(is_step)
     d <- integer(m)
-    # initial allocation from the observed drop ratios, with interleaved n
-    n <- n0; Sp <- S_prev; j <- 0L
-    for (i in seq_len(nrow(ev))) {
-      if (ev$type[i] == "c") { n <- n - 1L; next }
-      j <- j + 1L
-      d[j] <- if (!is.na(ev$S[i]) && Sp > 0) {
-        min(n, max(0L, as.integer(round(n * (1 - ev$S[i] / Sp)))))
-      } else 0L
-      if (n > 0L && d[j] > 0L) Sp <- Sp * (1 - d[j] / n)
-      n <- n - d[j]
-    }
-    # correct to the exact interval death total
-    diff_d <- D - sum(d)
-    if (m > 0L && diff_d != 0L) {
-      ord <- order(d, decreasing = TRUE); i <- 0L; guard <- 0L
+    if (m > 0L) {
+      n <- n0 - cg[1L]; Sp <- S_prev
+      for (j in seq_len(m)) {
+        d[j] <- if (!is.na(seg$S[j]) && Sp > 0) min(n, max(0L, as.integer(round(n * (1 - seg$S[j] / Sp))))) else 0L
+        if (n > 0L && d[j] > 0L) Sp <- Sp * (1 - d[j] / n)
+        n <- n - d[j] - cg[j + 1L]
+      }
+      # exact death total, best-fit adjustments
+      diff_d <- D - sum(d); guard <- 0L
       while (diff_d != 0L) {
-        j <- ord[(i %% m) + 1L]
-        if (diff_d > 0L) {
-          trial <- d; trial[j] <- trial[j] + 1L
-          if (alloc(trial)$ok) { d <- trial; diff_d <- diff_d - 1L }
-        } else if (d[j] > 0L) { d[j] <- d[j] - 1L; diff_d <- diff_d + 1L }
-        i <- i + 1L; guard <- guard + 1L
-        stopifnot("allocation loop stuck" = guard < 10000L)
+        best <- NULL; best_e <- Inf
+        for (j in seq_len(m)) {
+          trial <- d
+          if (diff_d > 0L) trial[j] <- trial[j] + 1L
+          else if (trial[j] > 0L) trial[j] <- trial[j] - 1L else next
+          e <- err(trial, cg)
+          if (e < best_e) { best_e <- e; best <- trial }
+        }
+        stopifnot("no feasible allocation adjustment" = !is.null(best))
+        d <- best; diff_d <- diff_d + if (diff_d > 0L) -1L else 1L
+        guard <- guard + 1L; stopifnot("allocation loop stuck" = guard < 10000L)
+      }
+      # ---- greedy refinement (Guyot-style iteration): move single censors
+      # between gaps, or single deaths between steps, while the fit improves
+      cur <- err(d, cg); guard <- 0L
+      repeat {
+        improved <- FALSE
+        if (C > 0L) for (a in seq_len(m + 1L)) for (b in seq_len(m + 1L)) {
+          if (a == b || cg[a] <= 0L) next   # test the CURRENT vector: cg
+          trial <- cg                        # mutates inside the loop
+          trial[a] <- trial[a] - 1L; trial[b] <- trial[b] + 1L
+          e <- err(d, trial)
+          if (e < cur - 1e-12) { cg <- trial; cur <- e; improved <- TRUE }
+        }
+        if (m > 1L) for (a in seq_len(m)) for (b in seq_len(m)) {
+          if (a == b || d[a] <= 0L) next
+          trial <- d; trial[a] <- trial[a] - 1L; trial[b] <- trial[b] + 1L
+          e <- err(trial, cg)
+          if (e < cur - 1e-12) { d <- trial; cur <- e; improved <- TRUE }
+        }
+        guard <- guard + 1L
+        if (!improved || guard > 100L) break
       }
     }
-    # emit IPD rows in timeline order
-    j <- 0L
-    for (i in seq_len(nrow(ev))) {
-      if (ev$type[i] == "c") { ipd_t <- c(ipd_t, ev$t[i]); ipd_e <- c(ipd_e, 0L) }
-      else {
-        j <- j + 1L
-        if (d[j] > 0L) { ipd_t <- c(ipd_t, rep(ev$t[i], d[j])); ipd_e <- c(ipd_e, rep(1L, d[j])) }
-      }
+    # ---- emit ----
+    for (j in seq_len(m)) if (d[j] > 0L) {
+      ipd_t <- c(ipd_t, rep(seg$t[j], d[j])); ipd_e <- c(ipd_e, rep(1L, d[j]))
     }
-    S_prev <- alloc(d)$S
+    for (g in seq_len(m + 1L)) if (cg[g] > 0L) {
+      lo <- gaps_lo[g]; hi <- gaps_hi[g]
+      ipd_t <- c(ipd_t, lo + (hi - lo) * seq_len(cg[g]) / (cg[g] + 1L))
+      ipd_e <- c(ipd_e, rep(0L, cg[g]))
+    }
+    w <- walk(d, cg)
+    S_prev <- if (!is.null(w)) w$S_end else S_prev
   }
   nl <- anchors$n[nrow(anchors)]; tl <- anchors$t[nrow(anchors)]
   if (nl > 0L) { ipd_t <- c(ipd_t, rep(max(tl, t_end), nl)); ipd_e <- c(ipd_e, rep(0L, nl)) }
