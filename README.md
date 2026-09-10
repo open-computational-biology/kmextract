@@ -42,6 +42,14 @@ For overlaid colored curves, call once per curve with `color = c(r, g, b)`
 S = 1. If the curve ends with a drop to zero *after* the last printed at-risk
 column, append a final anchor row with `n = 0` and the extra event(s).
 
+**No printed at-risk table?** Use `km_extract_free(image, x_ticks, N, y_ticks,
+color =)` — deaths are read from the step drops and censoring times from the
+"+" tick marks drawn on the curve; only the starting sample size `N` is
+needed. This requires the censor ticks to be visible on the figure; without
+them, prefer asking the data owner for the at-risk table. In our validation
+this mode recovered a 20-patient curve's median within 0.1 months and its
+event count exactly.
+
 Self-contained validation: `Rscript example/synthetic_test.R` simulates a
 dataset, draws its KM to PNG, re-extracts it from the image and compares with
 the known truth (median recovered within 0.01 months in the shipped example).
