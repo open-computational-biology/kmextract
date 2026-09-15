@@ -41,10 +41,81 @@
   x_row <- rows[which.max(vapply(rows, function(r) longest_run(dark[r, ]), 0L))]
   cols <- 1:floor(w * 0.4)
   y_col <- cols[which.max(vapply(cols, function(c) longest_run(dark[, c]), 0L))]
-  # extend to the full thickness of the axis lines
+  # extend to the full thickness of the axis lines, on both sides: x_row/y_col
+  # are the OUTER edges (bottom / left), x_top/y_right the INNER edges that the
+  # plot area starts from — bold-axis themes make these bands several px thick.
   while (x_row + 1L <= h && sum(dark[x_row + 1L, ]) > 0.5 * sum(dark[x_row, ])) x_row <- x_row + 1L
   while (y_col - 1L >= 1L && sum(dark[, y_col - 1L]) > 0.5 * sum(dark[, y_col])) y_col <- y_col - 1L
-  list(x_row = x_row, y_col = y_col)
+  x_top <- x_row
+  while (x_top - 1L >= 1L && sum(dark[x_top - 1L, ]) > 0.5 * sum(dark[x_row, ])) x_top <- x_top - 1L
+  y_right <- y_col
+  while (y_right + 1L <= w && sum(dark[, y_right + 1L]) > 0.5 * sum(dark[, y_col])) y_right <- y_right + 1L
+  list(x_row = x_row, y_col = y_col, x_top = x_top, y_right = y_right)
+}
+
+
+.km_find_labels <- function(g, axes, dark_thresh) {
+  # Fallback calibration for figures WITHOUT axis tick marks (labels only):
+  # ggplot centers each tick label under its tick position, so the centroid of
+  # each label's text blob calibrates the axis. Digit blobs of one label are
+  # merged with a gap scaled to the image size (a fixed small gap would split
+  # "20" into "2" and "0").
+  dark <- g < dark_thresh
+  h <- nrow(g); w <- ncol(g)
+  gap_x <- max(30L, as.integer(round(w / 40)))
+  gap_y <- max(20L, as.integer(round(h / 40)))
+  # x labels: first contiguous text row-block below the x-axis band
+  rows <- (axes$x_row + 4L):min(h, axes$x_row + 120L)
+  has_txt <- vapply(rows, function(r) any(dark[r, min(axes$y_right + 1L, w):w]), TRUE)
+  x_px <- integer(0)
+  if (any(has_txt)) {
+    idx <- rows[has_txt]
+    blocks <- split(idx, cumsum(c(1L, diff(idx) > 4L)))
+    b <- blocks[[1]]
+    xb <- dark[b, , drop = FALSE]
+    x_px <- .km_group_centers(setdiff(which(colSums(xb) > 0), 1:axes$y_right),
+                              gap = gap_x)
+  }
+  # y labels: text in the band left of the y-axis, above the x-axis band
+  # (excludes the rotated axis title, which sits further left)
+  c1 <- max(1L, axes$y_col - 6L); c0 <- max(1L, axes$y_col - as.integer(round(w / 15)))
+  y_px <- integer(0)
+  if (c1 > c0) {
+    yb <- dark[1:max(1L, axes$x_top - 10L), c0:c1, drop = FALSE]
+    y_px <- .km_group_centers(which(rowSums(yb) > 0), gap = gap_y)
+  }
+  list(x_px = x_px, y_px = y_px)
+}
+
+
+.km_calibrate <- function(g, axes, x_ticks, y_ticks, dark_thresh) {
+  # Tick marks first; when their counts do not match the expected values, fall
+  # back to label centroids axis by axis.
+  ticks <- .km_find_ticks(g, axes, dark_thresh)
+  labs <- NULL
+  if (length(ticks$x_px) != length(x_ticks)) {
+    labs <- .km_find_labels(g, axes, dark_thresh)
+    if (length(labs$x_px) == length(x_ticks)) {
+      message("x-axis: no usable tick marks (found ", length(ticks$x_px),
+              ", expected ", length(x_ticks), ") - calibrated on label centroids")
+      ticks$x_px <- labs$x_px
+    } else {
+      stop("found ", length(ticks$x_px), " x-ticks and ", length(labs$x_px),
+           " x-labels, expected ", length(x_ticks))
+    }
+  }
+  if (length(ticks$y_px) != length(y_ticks)) {
+    if (is.null(labs)) labs <- .km_find_labels(g, axes, dark_thresh)
+    if (length(labs$y_px) == length(y_ticks)) {
+      message("y-axis: no usable tick marks (found ", length(ticks$y_px),
+              ", expected ", length(y_ticks), ") - calibrated on label centroids")
+      ticks$y_px <- labs$y_px
+    } else {
+      stop("found ", length(ticks$y_px), " y-ticks and ", length(labs$y_px),
+           " y-labels, expected ", length(y_ticks))
+    }
+  }
+  ticks
 }
 
 .km_group_centers <- function(idx, gap = 15L) {
@@ -88,7 +159,7 @@
 .km_trace <- function(mask, axes, y_top_px, seed) {
   h <- nrow(mask); w <- ncol(mask)
   prev <- if (seed) y_top_px else NA_integer_
-  xs <- (axes$y_col + 6L):w
+  xs <- (axes$y_right + 6L):w
   ys <- rep(NA_integer_, length(xs))
   hh <- rep(0L, length(xs))
   tt <- rep(NA_integer_, length(xs))
@@ -96,7 +167,7 @@
   last_seen <- NA_integer_
   for (k in seq_along(xs)) {
     x <- xs[k]
-    col <- which(mask[1:(axes$x_row - 2L), x]); col <- col[col > 5L]
+    col <- which(mask[1:(axes$x_top - 2L), x]); col <- col[col > 5L]
     if (!length(col)) { ys[k] <- prev; next }
     last_seen <- x
     if (is.na(prev)) {
@@ -313,12 +384,7 @@ km_extract <- function(image_path, x_ticks, anchors, t_end,
   img <- .km_read_image(image_path)
   g <- (img[, , 1] + img[, , 2] + img[, , 3]) / 3
   axes <- .km_find_axes(g, dark_thresh)
-  ticks <- .km_find_ticks(g, axes, dark_thresh)
-  if (length(ticks$x_px) != length(x_ticks))
-    stop("found ", length(ticks$x_px), " x-ticks, expected ", length(x_ticks),
-         " (at px ", paste(ticks$x_px, collapse = ","), ")")
-  if (length(ticks$y_px) != length(y_ticks))
-    stop("found ", length(ticks$y_px), " y-ticks, expected ", length(y_ticks))
+  ticks <- .km_calibrate(g, axes, x_ticks, y_ticks, dark_thresh)
   mask <- .km_curve_mask(img, color, dark_thresh, color_tol)
   y_top <- ticks$y_px[which.max(y_ticks)]
   tr <- .km_trace(mask, axes, y_top, seed)
@@ -373,11 +439,7 @@ km_extract_free <- function(image_path, x_ticks, N,
   img <- .km_read_image(image_path)
   g <- (img[, , 1] + img[, , 2] + img[, , 3]) / 3
   axes <- .km_find_axes(g, dark_thresh)
-  ticks <- .km_find_ticks(g, axes, dark_thresh)
-  if (length(ticks$x_px) != length(x_ticks))
-    stop("found ", length(ticks$x_px), " x-ticks, expected ", length(x_ticks))
-  if (length(ticks$y_px) != length(y_ticks))
-    stop("found ", length(ticks$y_px), " y-ticks, expected ", length(y_ticks))
+  ticks <- .km_calibrate(g, axes, x_ticks, y_ticks, dark_thresh)
   mask <- .km_curve_mask(img, color, dark_thresh, color_tol)
   y_top <- ticks$y_px[which.max(y_ticks)]
   tr <- .km_trace(mask, axes, y_top, seed)
