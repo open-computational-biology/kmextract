@@ -340,7 +340,7 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
     if (cc == 0L) next
     mt <- marks_t[[i]]
     ct <- if (length(mt)) rep(mt, length.out = cc)[order(rep(mt, length.out = cc))] else
-          rep(subgaps$t0[i] + 0.02, cc)
+          rep(subgaps$t0[i], cc)
     # canonical display rule: hidden censors superpose exactly on a visible
     # mark of their gap; a gap with no visible mark hides them ON its opening
     # riser (where a glyph is invisible on the source figure too)
@@ -571,8 +571,14 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
                                              data = d, ties = "efron"))))
     }, 0)
   }
-  # canonical solution: median HR if available, else first
-  can <- if (!is.null(hr)) which.min(abs(hr - stats::median(hr))) else 1L
+  # canonical solution: among the admissible set, prefer the ones whose hidden
+  # censors all superpose on visible marks (no "orphan" censor in a mark-less
+  # gap, which would have to be drawn at an invented position); tie-break by
+  # median HR when a comparator is given
+  orphans <- vapply(sv$solutions[kept], function(sol)
+    sum(sol$c[subgaps$lb == 0L]), 0L)
+  pool <- which(orphans == min(orphans))
+  can <- if (!is.null(hr)) pool[which.min(abs(hr[pool] - stats::median(hr)))] else pool[1L]
   # certificate: plateau deviations of the canonical solution, in px
   ipd0 <- ipds[[can]]
   sf0 <- survival::survfit(survival::Surv(time, event) ~ 1, data = ipd0)
