@@ -426,11 +426,17 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
     data.frame(gap = g0, t0 = head(cuts, -1L), t1 = cuts[-1L],
                check = cuts[-1L] %in% interior)
   }))
+  # a mark's gap comes from its LEVEL (authoritative); its pixel time can sit
+  # a hair on the wrong side of the riser time (marks merged into a riser
+  # stroke) - clamp it inside its own gap so it is neither dropped from the
+  # constraints nor mis-ordered against the death in the output dataset
+  mk$t_cl <- pmin(pmax(mk$t, bounds[mk$gap + 1L] + 1e-6),
+                  bounds[mk$gap + 2L] - 1e-6)
   subgaps$lb <- vapply(seq_len(nrow(subgaps)), function(i)
-    sum(mk$gap == subgaps$gap[i] & mk$t > subgaps$t0[i] - 1e-9 & mk$t <= subgaps$t1[i] + 1e-9), 0L)
+    sum(mk$gap == subgaps$gap[i] & mk$t_cl > subgaps$t0[i] - 1e-9 & mk$t_cl <= subgaps$t1[i] + 1e-9), 0L)
   # marks listed per subgap (canonical censor positions)
   marks_t <- lapply(seq_len(nrow(subgaps)), function(i)
-    sort(mk$t[mk$gap == subgaps$gap[i] & mk$t > subgaps$t0[i] - 1e-9 & mk$t <= subgaps$t1[i] + 1e-9]))
+    sort(mk$t_cl[mk$gap == subgaps$gap[i] & mk$t_cl > subgaps$t0[i] - 1e-9 & mk$t_cl <= subgaps$t1[i] + 1e-9]))
   N <- anchors$n[1]
   sv <- .kmx_solve(riser_t, L, tolS, subgaps, anchors, N, t_end, max_solutions)
   relaxed <- "none"
