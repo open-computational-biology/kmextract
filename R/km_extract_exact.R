@@ -210,9 +210,12 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
       if (is.null(rn)) next
       # a residue must FLOAT between plateau levels: a stroke reaching the
       # plateau one level further is the neighbouring riser, not a glyph
-      if (any(rn[, "top"] <= up - half - m & rn[, "bot"] >= up - half &
+      arm_max <- Tk + 2L * m       # a glyph arm cannot reach further than this
+      if (any(rn[, "top"] <= up - half - m & rn[, "top"] >= up - half - arm_max &
+              rn[, "bot"] >= up - half &
               rn[, "top"] >= up_guard)) top_cols <- c(top_cols, x)
-      if (any(rn[, "bot"] >= lo + half + m & rn[, "top"] <= lo + half &
+      if (any(rn[, "bot"] >= lo + half + m & rn[, "bot"] <= lo + half + arm_max &
+              rn[, "top"] <= lo + half &
               rn[, "bot"] <= lo_guard)) bot_cols <- c(bot_cols, x)
     }
     if (length(top_cols))
@@ -337,12 +340,53 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
     if (cc == 0L) next
     mt <- marks_t[[i]]
     ct <- if (length(mt)) rep(mt, length.out = cc)[order(rep(mt, length.out = cc))] else
-          rep((subgaps$t0[i] + subgaps$t1[i]) / 2, cc)
+          rep(subgaps$t0[i] + 0.02, cc)
     # canonical display rule: hidden censors superpose exactly on a visible
-    # mark of their gap; gaps with no visible mark use the midpoint
+    # mark of their gap; a gap with no visible mark hides them ON its opening
+    # riser (where a glyph is invisible on the source figure too)
     ipd <- rbind(ipd, data.frame(time = ct, event = 0L))
   }
   ipd[order(ipd$time, -ipd$event), ]
+}
+
+# ---------------------------------------------------------------------------
+# Sub-riser refinement: a riser carrying several deaths is drawn as a mini
+# staircase; read each sub-step's position from the monotone envelope of the
+# ink's top profile (glyph arms poke UP, which a running max ignores).
+# ---------------------------------------------------------------------------
+
+.kmx_riser_subtimes <- function(path, j, d, S_before, n_before, to_t, to_px_y) {
+  plat <- path$plateaus; cols <- path$cols; Tk <- path$T
+  half <- as.integer(ceiling(Tk / 2))
+  x0 <- plat$x1[j]; x1 <- plat$x0[j + 1L]
+  if (x1 - x0 < 2L || d < 2L) return(rep(to_t(path$risers$x_px[j]), d))
+  up <- plat$level_px[j]; lo <- plat$level_px[j + 1L]
+  xs <- x0:x1
+  env <- -Inf
+  tops <- vapply(xs, function(x) {
+    rn <- cols[[x]]
+    if (is.null(rn)) return(NA_real_)
+    i <- which(rn[, "bot"] >= up - half & rn[, "top"] <= lo + half)
+    if (!length(i)) return(NA_real_)
+    min(rn[i, "top"])
+  }, 0)
+  for (i in seq_along(tops)) {
+    if (!is.na(tops[i]) && tops[i] > env) env <- tops[i]
+    tops[i] <- env
+  }
+  # after the k-th sub-death the upper ink terminates at level_k; death k's
+  # column is where the envelope first clears that level
+  S <- S_before; n <- n_before
+  out <- numeric(d)
+  for (k in seq_len(d)) {
+    L_prev <- to_px_y(S)                       # level BEFORE this sub-death
+    hit <- which(tops > L_prev + half)         # upper line has terminated
+    out[k] <- if (length(hit)) to_t(xs[max(1L, hit[1] - 1L)]) else
+                to_t(path$risers$x_px[j])
+    S <- S * (1 - 1 / n); n <- n - 1L
+  }
+  out <- pmax(out, to_t(x0 + 1L))
+  cummax(out)                                  # enforce monotone sub-times
 }
 
 # ---------------------------------------------------------------------------
@@ -508,6 +552,27 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
   can <- if (!is.null(hr)) which.min(abs(hr - stats::median(hr))) else 1L
   # certificate: plateau deviations of the canonical solution, in px
   ipd0 <- ipds[[can]]
+  # sub-riser refinement of multi-death risers (visual + time fidelity)
+  to_px_y <- function(S) (S - stats::coef(fy)[1]) / stats::coef(fy)[2]
+  sol0 <- sv$solutions[kept][[can]]
+  ncur <- N; Scur <- 1
+  for (j in seq_along(riser_t)) {
+    cg <- sum(subgaps$gap == j - 1L)
+    ncur <- ncur - sum(sol0$c[which(subgaps$gap == j - 1L)])
+    dj <- sol0$d[j]
+    if (dj >= 2L) {
+      subt <- .kmx_riser_subtimes(path, j, dj, Scur, ncur, to_t, to_px_y)
+      # deaths at this riser precede every censor of the following gap
+      nxt <- unlist(marks_t[which(subgaps$gap == j)])
+      hi_b <- if (length(nxt)) min(nxt) - 0.02 else
+                (if (j < length(riser_t)) riser_t[j + 1L] else t_end) - 0.02
+      subt <- cummax(pmin(subt, hi_b))
+      idx <- which(ipd0$event == 1L & abs(ipd0$time - riser_t[j]) < 1e-6)
+      ipd0$time[idx] <- subt[seq_along(idx)]
+    }
+    for (k in seq_len(dj)) { Scur <- Scur * (1 - 1 / ncur); ncur <- ncur - 1L }
+  }
+  ipd0 <- ipd0[order(ipd0$time, -ipd0$event), ]
   sf0 <- survival::survfit(survival::Surv(time, event) ~ 1, data = ipd0)
   Scan <- summary(sf0, times = riser_t + 1e-9, extend = TRUE)$surv
   cert <- data.frame(riser_t = round(riser_t, 2), S_measured = round(L, 4),
