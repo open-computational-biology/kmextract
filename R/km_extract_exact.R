@@ -118,19 +118,28 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
     up <- plat$level_px[k]; lo <- plat$level_px[k + 1L]
     x0k <- plat$x1[k] + 1L; x1k <- plat$x0[k + 1L] - 1L
     arm <- NULL
-    if (x1k - x0k >= Tk + 2L && (lo - up) >= 2L * (Tk + 3L)) {
-      ax <- integer(0); alev <- numeric(0)
+    if (x1k - x0k >= Tk + 4L && (lo - up) >= 2L * (Tk + 3L)) {
+      # collect plain single-run columns strictly between the two levels: a
+      # real intermediate mini plateau shows a flat run of them
+      fx_ <- integer(0); flev <- numeric(0)
       for (x in x0k:x1k) {
         rn <- cols[[x]]
-        if (is.null(rn)) next
-        thin <- (rn[, "bot"] - rn[, "top"] + 1L) <= 4L &
-                rn[, "top"] >= up + half + 2L & rn[, "bot"] <= lo - half - 2L
-        if (any(thin)) {
-          i <- which(thin)[1]
-          ax <- c(ax, x); alev <- c(alev, (rn[i, "top"] + rn[i, "bot"]) / 2)
+        if (is.null(rn) || nrow(rn) != 1L) next
+        h <- rn[1, "bot"] - rn[1, "top"] + 1L
+        c_ <- (rn[1, "top"] + rn[1, "bot"]) / 2
+        if (h <= Tk + 2L && c_ >= up + half + 3L && c_ <= lo - half - 3L) {
+          fx_ <- c(fx_, x); flev <- c(flev, c_)
         }
       }
-      if (length(ax) >= 2L && diff(range(alev)) <= 3) arm <- list(x = ax, lev = mean(alev))
+      if (length(fx_) >= 3L) {
+        # the largest cluster of near-equal-level plain columns is the plateau
+        o <- order(flev); fx_ <- fx_[o]; flev <- flev[o]
+        grp <- cumsum(c(1L, abs(diff(flev)) > 2))
+        best <- which.max(tabulate(grp))
+        sel <- grp == best
+        if (sum(sel) >= 3L)
+          arm <- list(x = sort(fx_[sel]), lev = stats::median(flev[sel]))
+      }
     }
     if (!is.null(arm)) {
       # envelope jumps locate the two sub-risers (de-biased by half a width)
