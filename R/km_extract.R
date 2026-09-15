@@ -91,6 +91,8 @@
   xs <- (axes$y_col + 6L):w
   ys <- rep(NA_integer_, length(xs))
   hh <- rep(0L, length(xs))
+  tt <- rep(NA_integer_, length(xs))
+  bb <- rep(NA_integer_, length(xs))
   last_seen <- NA_integer_
   for (k in seq_along(xs)) {
     x <- xs[k]
@@ -108,31 +110,52 @@
     if (length(joined)) {
       r <- joined[[1]]
       hh[k] <- max(r) - min(r) + 1L
-      newy <- if (max(r) - min(r) > 8L) max(prev, max(r) - 2L)   # vertical drop
+      tt[k] <- min(r); bb[k] <- max(r)
+      # A tall run SYMMETRIC around the current level is a censor tick ("+")
+      # straddling the line, not a drop: keep the trace on the line. A true
+      # drop is asymmetric (the run hangs below the upper plateau the trace
+      # is on), so it fails the >= 7 px upper-overhang test.
+      tick_like <- (max(r) - min(r) > 8L) &&
+                   (prev - min(r) >= 7L) && (max(r) - prev >= 7L)
+      newy <- if (tick_like) prev
+              else if (max(r) - min(r) > 8L) max(prev, max(r) - 2L)   # vertical drop
               else max(prev, as.integer(round((min(r) + max(r)) / 2)))  # flat line: center
       prev <- newy
     } else {
       below <- Filter(function(r) prev < min(r) && min(r) <= prev + 150L, runs)
       if (length(below)) {
         r <- below[[which.min(vapply(below, min, 0L))]]
+        hh[k] <- max(r) - min(r) + 1L
+        tt[k] <- min(r); bb[k] <- max(r)
         prev <- if (max(r) - min(r) <= 8L) as.integer(round((min(r) + max(r)) / 2)) else max(r) - 2L
       }
     }
     ys[k] <- prev
   }
   keep <- !is.na(ys)
-  list(x = xs[keep], y = ys[keep], h = hh[keep], last_seen = last_seen)
+  list(x = xs[keep], y = ys[keep], h = hh[keep],
+       top = tt[keep], bot = bb[keep], last_seen = last_seen)
 }
 
 
 .km_censor_ticks <- function(tr, t, S, min_drop) {
-  thick <- stats::median(tr$h[tr$h > 0])
+  # A censor tick ("+") is a stroke centered on the line: it protrudes ABOVE the
+  # line's top edge AND BELOW its bottom edge, roughly symmetrically. A step
+  # drop only produces stroke on one side of the traced level (from the upper
+  # plateau down to it), so requiring BOTH protrusions rejects drops by
+  # construction (the upward overhang alone would still be fooled at the drop
+  # column, whose top edge is the upper plateau).
+  flat_cols <- tr$h > 0L & tr$h <= 8L          # plain-line columns (cf. drop rule)
+  thick <- stats::median(tr$h[flat_cols])
+  if (is.na(thick)) thick <- stats::median(tr$h[tr$h > 0L])
   if (is.na(thick)) return(numeric(0))
-  flat_at <- function(k) {
-    lo <- max(1L, k - 8L); hi <- min(length(S), k + 8L)
-    (S[lo] - S[hi]) < min_drop / 2
-  }
-  cand <- which(tr$h >= thick + 5L & vapply(seq_along(tr$h), flat_at, TRUE))
+  m <- max(2L, as.integer(ceiling(thick / 2)))  # required overhang on each side
+  half <- as.integer(ceiling(thick / 2))
+  cand <- which(tr$h > 0L &
+                tr$h <= 6L * max(thick, 3L) &   # a "+" is ~3-4x the line width;
+                                                # excludes panel borders/axes
+                tr$top <= tr$y - half - m &     # pokes above the line top edge
+                tr$bot >= tr$y + half + m)      # AND below the line bottom edge
   out <- numeric(0)
   if (length(cand)) {
     b <- cumsum(c(1L, diff(cand) > 3L))
