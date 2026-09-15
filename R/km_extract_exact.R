@@ -104,6 +104,68 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
       x_px = if (length(ctr)) mean(range(ctr)) else mean(c(lo, hi)),
       width = length(conn), hidden = !length(conn)))
   }
+  # --- evidence-driven riser splitting: a censor mark hidden INSIDE a merged
+  # riser leaves a detached thin arm at an intermediate level (the mini
+  # plateau of its staircase). Where such an arm exists, promote the mini
+  # plateau (zero plain columns, level = the arm) and split the riser in two,
+  # so the censor can live between the sub-deaths and be drawn where the
+  # source figure shows it. Risers without arm evidence stay merged (their
+  # sub-steps are cosmetic and handled by the sub-time refinement). ----------
+  half <- as.integer(ceiling(Tk / 2))
+  new_plat <- plat[1, , drop = FALSE]
+  new_ris <- risers[0, , drop = FALSE]
+  for (k in seq_len(nrow(risers))) {
+    up <- plat$level_px[k]; lo <- plat$level_px[k + 1L]
+    x0k <- plat$x1[k] + 1L; x1k <- plat$x0[k + 1L] - 1L
+    arm <- NULL
+    if (x1k - x0k >= Tk + 2L && (lo - up) >= 2L * (Tk + 3L)) {
+      ax <- integer(0); alev <- numeric(0)
+      for (x in x0k:x1k) {
+        rn <- cols[[x]]
+        if (is.null(rn)) next
+        thin <- (rn[, "bot"] - rn[, "top"] + 1L) <= 4L &
+                rn[, "top"] >= up + half + 2L & rn[, "bot"] <= lo - half - 2L
+        if (any(thin)) {
+          i <- which(thin)[1]
+          ax <- c(ax, x); alev <- c(alev, (rn[i, "top"] + rn[i, "bot"]) / 2)
+        }
+      }
+      if (length(ax) >= 2L && diff(range(alev)) <= 3) arm <- list(x = ax, lev = mean(alev))
+    }
+    if (!is.null(arm)) {
+      # envelope jumps locate the two sub-risers (de-biased by half a width)
+      xs <- x0k:x1k
+      tops <- vapply(xs, function(x) {
+        rn <- cols[[x]]
+        if (is.null(rn)) return(NA_real_)
+        i <- which(rn[, "bot"] >= up - half & rn[, "top"] <= lo + half &
+                   rn[, "top"] >= up - half - 1L)
+        if (!length(i)) return(NA_real_)
+        min(rn[i, "top"])
+      }, 0)
+      env <- up - half
+      for (i in seq_along(tops)) {
+        if (!is.na(tops[i]) && tops[i] > env) env <- tops[i]
+        tops[i] <- env
+      }
+      iA <- which(tops > up + half)[1]
+      iB <- which(tops > arm$lev + half)[1]
+      xA <- if (!is.na(iA)) xs[max(1L, iA - half - 2L)] else (x0k + min(arm$x)) / 2
+      xB <- if (!is.na(iB)) xs[max(1L, iB - half - 2L)] else (max(arm$x) + x1k) / 2
+      if (xB <= xA + 1L) xB <- xA + 2L
+      new_ris <- rbind(new_ris, data.frame(x_px = xA, width = 0L, hidden = FALSE))
+      new_plat <- rbind(new_plat, data.frame(level_px = arm$lev, x0 = min(arm$x),
+                                             x1 = max(arm$x), n_plain = 0L))
+      new_ris <- rbind(new_ris, data.frame(x_px = xB, width = 0L, hidden = FALSE))
+      new_plat <- rbind(new_plat, plat[k + 1L, , drop = FALSE])
+    } else {
+      new_ris <- rbind(new_ris, risers[k, , drop = FALSE])
+      new_plat <- rbind(new_plat, plat[k + 1L, , drop = FALSE])
+    }
+  }
+  plat <- new_plat; risers <- new_ris
+  rownames(plat) <- NULL; rownames(risers) <- NULL
+  stopifnot(all(diff(plat$level_px) > 0))
   # end of curve: last column with ink (marks included)
   x_last <- max(which(!vapply(cols, is.null, TRUE)))
   list(plateaus = plat, risers = risers, T = Tk, cols = cols,
@@ -129,6 +191,11 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
   R <- nrow(ris)
   for (k in seq_len(nrow(plat))) {
     lvl <- plat$level_px[k]
+    if (plat$n_plain[k] == 0L) {
+      # arm-evidence mini plateau: the defining arm IS the censor mark
+      add(k - 1L, (plat$x0[k] + plat$x1[k]) / 2, "D")
+      next
+    }
     # --- channel A: symmetric protrusion, scanned over the full gap span ----
     # (a mark at the plateau edge sits beyond the last clean column; riser
     # strokes self-exclude: their top never clears the level by the margin)
