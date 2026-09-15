@@ -380,8 +380,9 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
   out <- numeric(d)
   for (k in seq_len(d)) {
     L_prev <- to_px_y(S)                       # level BEFORE this sub-death
-    hit <- which(tops > L_prev + half)         # upper line has terminated
-    out[k] <- if (length(hit)) to_t(xs[max(1L, hit[1] - 1L)]) else
+    hit <- which(tops > L_prev + half)         # upper line has terminated -
+    # which happens about half a line width past the sub-drop itself
+    out[k] <- if (length(hit)) to_t(xs[max(1L, hit[1] - half - 2L)]) else
                 to_t(path$risers$x_px[j])
     S <- S * (1 - 1 / n); n <- n - 1L
   }
@@ -529,6 +530,28 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
     if (any(keep)) { ipds <- ipds[keep]; kept <- kept[keep] }
     else warning("published-value filter eliminated every solution; ignoring it")
   }
+  # sub-riser refinement of multi-death risers, applied to every solution
+  # (visual + time fidelity; one time convention for stats and export)
+  to_px_y <- function(S) (S - stats::coef(fy)[1]) / stats::coef(fy)[2]
+  refine <- function(ipd, sol) {
+    ncur <- N; Scur <- 1
+    for (j in seq_along(riser_t)) {
+      ncur <- ncur - sum(sol$c[which(subgaps$gap == j - 1L)])
+      dj <- sol$d[j]
+      if (dj >= 2L) {
+        subt <- .kmx_riser_subtimes(path, j, dj, Scur, ncur, to_t, to_px_y)
+        nxt <- unlist(marks_t[which(subgaps$gap == j)])
+        hi_b <- if (length(nxt)) min(nxt) - 0.02 else
+                  (if (j < length(riser_t)) riser_t[j + 1L] else t_end) - 0.02
+        subt <- cummax(pmin(subt, hi_b))
+        idx <- which(ipd$event == 1L & abs(ipd$time - riser_t[j]) < 1e-6)
+        ipd$time[idx] <- subt[seq_along(idx)]
+      }
+      for (k in seq_len(dj)) { Scur <- Scur * (1 - 1 / ncur); ncur <- ncur - 1L }
+    }
+    ipd[order(ipd$time, -ipd$event), ]
+  }
+  ipds <- Map(refine, ipds, sv$solutions[kept])
   # per-solution statistics
   stat <- function(ipd) {
     sf <- survival::survfit(survival::Surv(time, event) ~ 1, data = ipd, conf.type = "log-log")
@@ -552,27 +575,6 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
   can <- if (!is.null(hr)) which.min(abs(hr - stats::median(hr))) else 1L
   # certificate: plateau deviations of the canonical solution, in px
   ipd0 <- ipds[[can]]
-  # sub-riser refinement of multi-death risers (visual + time fidelity)
-  to_px_y <- function(S) (S - stats::coef(fy)[1]) / stats::coef(fy)[2]
-  sol0 <- sv$solutions[kept][[can]]
-  ncur <- N; Scur <- 1
-  for (j in seq_along(riser_t)) {
-    cg <- sum(subgaps$gap == j - 1L)
-    ncur <- ncur - sum(sol0$c[which(subgaps$gap == j - 1L)])
-    dj <- sol0$d[j]
-    if (dj >= 2L) {
-      subt <- .kmx_riser_subtimes(path, j, dj, Scur, ncur, to_t, to_px_y)
-      # deaths at this riser precede every censor of the following gap
-      nxt <- unlist(marks_t[which(subgaps$gap == j)])
-      hi_b <- if (length(nxt)) min(nxt) - 0.02 else
-                (if (j < length(riser_t)) riser_t[j + 1L] else t_end) - 0.02
-      subt <- cummax(pmin(subt, hi_b))
-      idx <- which(ipd0$event == 1L & abs(ipd0$time - riser_t[j]) < 1e-6)
-      ipd0$time[idx] <- subt[seq_along(idx)]
-    }
-    for (k in seq_len(dj)) { Scur <- Scur * (1 - 1 / ncur); ncur <- ncur - 1L }
-  }
-  ipd0 <- ipd0[order(ipd0$time, -ipd0$event), ]
   sf0 <- survival::survfit(survival::Surv(time, event) ~ 1, data = ipd0)
   Scan <- summary(sf0, times = riser_t + 1e-9, extend = TRUE)$surv
   cert <- data.frame(riser_t = round(riser_t, 2), S_measured = round(L, 4),
