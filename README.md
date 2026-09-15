@@ -77,6 +77,54 @@ Run the shipped validation: `Rscript example/synthetic_test.R` and
 `Rscript example/adversarial_tests.R` (heavy censoring, curve-to-zero,
 N = 150, anchor-free round trips).
 
+## Exact mode (`km_extract_exact`)
+
+For figures that print an at-risk (cumulative events) table, exact mode
+replaces heuristic reconstruction with **constraint solving**: it extracts
+everything the figure determines exactly, and enumerates the complete set of
+datasets compatible with the figure where it does not.
+
+```r
+source("R/km_extract.R")
+source("R/km_extract_exact.R")
+res <- km_extract_exact(
+  "panel.png", x_ticks = c(0, 10, 20, 30),
+  anchors = data.frame(t = c(0, 10, 20, 30), n = c(60, 14, 2, 1),
+                       E = c(0, 20, 26, 26)),
+  # optional: printed summary values as exact (rounded-interval) constraints
+  known = list(surv = data.frame(time = 12, est = 44.0, lcl = 26.1, ucl = 60.5),
+               median = c(10.6, 7.2, 18.3), conf.type = "log-log"),
+  # optional: a comparator arm (time, event) to bound the Cox HR over the set
+  comparator = my_arm)
+res$unique        # TRUE when the figure pins the dataset completely
+res$n_solutions   # size of the enumerated admissible set
+res$bounds        # certified min/max per statistic over the set
+res$ipd           # canonical member (median-HR when a comparator is given)
+res$certificate   # per-plateau pixel deviations of the canonical solution
+km_overlay_exact(res, "panel.png", "overlay.png")   # human-readable certificate
+```
+
+How it works: (1) plateaus are re-measured on clean line columns and risers
+located on pure stroke columns; (2) censor marks are censused by three
+complementary channels — symmetric protrusion on plateaus, horizontal arm
+signatures at plateau edges, floating-bar residues at risers — each mark
+assigned to its inter-death gap by its LEVEL (which also resolves marks merged
+into a riser stroke); (3) a depth-first exact solver enumerates every
+(deaths-per-riser, censors-per-gap) sequence satisfying the anchors exactly,
+every measured plateau to pixel tolerance (with an affine allowance for
+label-centroid calibration drift), and at least the visible marks per gap;
+(4) printed summary values, when supplied, further filter the set as
+rounded-interval constraints.
+
+The contract, honestly stated: counts and orderings — which determine every
+KM statistic — are recovered exactly whenever the figure determines them
+(`unique = TRUE`); otherwise `bounds` gives the exact range of any statistic
+over all admissible datasets. Times are pixel-limited (~half a line width),
+which no statistic feels. Validation: `Rscript example/exact_roundtrip.R`
+(bold curves, no axis ticks, heavy ties, censors hugging deaths; the truth
+must be covered by the certified bounds — and is, including a case where the
+solution is unique and equals the truth).
+
 ## Caveats
 
 - This is a *reconstruction*, to be labeled as such in any output; it is not a
