@@ -125,6 +125,7 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
   A <- 3L * Tk                     # search window for arms; glyph arm ~ 1-1.5 T
   marks <- data.frame(gap = integer(0), x_px = numeric(0), channel = character(0))
   add <- function(gap, x, ch) marks <<- rbind(marks, data.frame(gap = gap, x_px = x, channel = ch))
+  bars <- list()                     # channel-A bar runs, emitted after the loop
   R <- nrow(ris)
   for (k in seq_len(nrow(plat))) {
     lvl <- plat$level_px[k]
@@ -157,12 +158,8 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
         }, 0L)
         tall <- grp[hts >= Tk + 2L * m - 1L]
         if (length(tall)) {
-          for (bar in split(tall, cumsum(c(1L, diff(tall) > 1L)))) {
-            wdt <- max(bar) - min(bar) + 1L
-            cnt <- max(1L, as.integer(round(wdt / 2.5)))
-            for (px_c in seq(min(bar), max(bar), length.out = cnt))
-              add(k - 1L, px_c, "A")
-          }
+          for (bar in split(tall, cumsum(c(1L, diff(tall) > 1L))))
+            bars[[length(bars) + 1L]] <- list(gap = k - 1L, lo = min(bar), hi = max(bar))
         } else add(k - 1L, mean(grp), "A")
       }
     }
@@ -187,6 +184,17 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
                 rn[, "top"] >= band[1] & rn[, "bot"] <= band[2]
         if (any(thin)) { add(k - 1L, plat$x1[k] + 0.5, "B"); break }
       }
+    }
+  }
+  # --- channel A emission: multiplicity from width, calibrated on the figure
+  # (a single "+" bar has a characteristic full-height width - the mode of the
+  # observed bar widths; a fused pair is ~twice that)
+  if (length(bars)) {
+    ws <- vapply(bars, function(b) b$hi - b$lo + 1L, 0L)
+    w1 <- as.integer(names(which.max(table(ws))))
+    for (b in bars) {
+      cnt <- max(1L, as.integer(round((b$hi - b$lo + 1L) / w1)))
+      for (px_c in seq(b$lo, b$hi, length.out = cnt)) add(b$gap, px_c, "A")
     }
   }
   # --- channel C: residues at riser columns ---------------------------------
