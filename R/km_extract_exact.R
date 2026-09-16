@@ -84,101 +84,127 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
   # risers between consecutive plateaus: columns whose stroke connects the levels
   risers <- data.frame(x_px = numeric(0), width = integer(0), hidden = logical(0))
   for (k in seq_len(nrow(plat) - 1L)) {
-    lo <- plat$x1[k]; hi <- plat$x0[k + 1L]
-    conn <- integer(0); pure <- integer(0)
-    for (x in lo:hi) {
-      rn <- cols[[x]]
-      if (is.null(rn)) next
-      hit <- rn[, "top"] <= plat$level_px[k] + Tk &
-             rn[, "bot"] >= plat$level_px[k + 1L] - Tk
-      if (any(hit)) {
-        conn <- c(conn, x)
-        # pure stroke: no glyph ink beyond either plateau line
-        if (any(hit & rn[, "top"] >= plat$level_px[k] - Tk / 2 - 1 &
-                      rn[, "bot"] <= plat$level_px[k + 1L] + Tk / 2 + 1))
-          pure <- c(pure, x)
-      }
-    }
-    ctr <- if (length(pure)) pure else conn
-    risers <- rbind(risers, data.frame(
-      x_px = if (length(ctr)) mean(range(ctr)) else mean(c(lo, hi)),
-      width = length(conn), hidden = !length(conn)))
+    rx <- .kmx_riser_x(cols, plat$x1[k], plat$x0[k + 1L],
+                       plat$level_px[k], plat$level_px[k + 1L], Tk)
+    risers <- rbind(risers, data.frame(x_px = rx$x, width = rx$width, hidden = rx$hidden))
   }
-  # --- evidence-driven riser splitting: a censor mark hidden INSIDE a merged
-  # riser leaves a detached thin arm at an intermediate level (the mini
-  # plateau of its staircase). Where such an arm exists, promote the mini
-  # plateau (zero plain columns, level = the arm) and split the riser in two,
-  # so the censor can live between the sub-deaths and be drawn where the
-  # source figure shows it. Risers without arm evidence stay merged (their
-  # sub-steps are cosmetic and handled by the sub-time refinement). ----------
+  # end of curve: last column with ink (marks included)
+  x_last <- max(which(!vapply(cols, is.null, TRUE)))
+  list(plateaus = plat, risers = risers, T = Tk, cols = cols,
+       x_last = x_last, r0 = r0, r1 = r1)
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2b — evidence-driven splitting of merged risers
+# ---------------------------------------------------------------------------
+# A merged riser (several deaths with no clean column between them) may hide
+# an intermediate plateau. The only evidence accepted is the CURVE ITSELF
+# being horizontal at an intermediate level: >= 2 adjacent columns whose ink
+# run floats between the bounding levels with the line's own thickness.
+# Glyph ink is deliberately NOT evidence: a "+" whose arm crosses a fused
+# stroke (a censor tied with the deaths, drawn mid-riser by some renderers)
+# is indistinguishable from a mark on a hidden plateau by geometry alone, and
+# the level it suggests is generally no KM level. Each supported level becomes
+# a mini plateau; the k+1 sub-risers are located exactly like ordinary risers
+# (from the columns whose stroke connects the two levels). Splits respect the
+# anchors: never more risers than deaths in an anchor interval.
+
+.kmx_riser_x <- function(cols, x_lo, x_hi, up, lo, Tk) {
+  conn <- integer(0); pure <- integer(0)
+  for (x in x_lo:x_hi) {
+    rn <- cols[[x]]
+    if (is.null(rn)) next
+    hit <- rn[, "top"] <= up + Tk & rn[, "bot"] >= lo - Tk
+    if (any(hit)) {
+      conn <- c(conn, x)
+      # pure stroke: no ink beyond either plateau line (a glyph bar, or the
+      # continuation of a fused stroke, disqualifies the column)
+      if (any(hit & rn[, "top"] >= up - Tk / 2 - 1 & rn[, "bot"] <= lo + Tk / 2 + 1))
+        pure <- c(pure, x)
+    }
+  }
+  ctr <- if (length(pure)) pure else conn
+  list(x = if (length(ctr)) mean(range(ctr)) else mean(c(x_lo, x_hi)),
+       width = length(conn), hidden = !length(conn))
+}
+
+.kmx_split_risers <- function(path, anchors, to_t) {
+  plat <- path$plateaus; risers <- path$risers; cols <- path$cols; Tk <- path$T
   half <- as.integer(ceiling(Tk / 2))
+  riser_t <- to_t(risers$x_px)
+  interval_of <- function(t) findInterval(t, anchors$t, left.open = TRUE)
+  D <- diff(anchors$E)                                   # deaths per interval
+  R <- tabulate(interval_of(riser_t), nbins = length(D)) # risers per interval
+  spare <- pmax(0L, D - R)                               # splits still allowed
   new_plat <- plat[1, , drop = FALSE]
   new_ris <- risers[0, , drop = FALSE]
   for (k in seq_len(nrow(risers))) {
     up <- plat$level_px[k]; lo <- plat$level_px[k + 1L]
     x0k <- plat$x1[k] + 1L; x1k <- plat$x0[k + 1L] - 1L
-    arm <- NULL
-    if (x1k - x0k >= Tk + 4L && (lo - up) >= 2L * (Tk + 3L)) {
-      # collect plain single-run columns strictly between the two levels: a
-      # real intermediate mini plateau shows a flat run of them
-      fx_ <- integer(0); flev <- numeric(0)
+    levels <- NULL
+    j <- interval_of(riser_t[k])
+    if (x1k - x0k >= Tk + 4L && (lo - up) >= 2L * (Tk + 3L) &&
+        j >= 1L && j <= length(D) && spare[j] > 0L) {
+      # floating stroke-height runs, strictly between the bounding lines
+      ev <- data.frame(x = integer(0), lev = numeric(0))
       for (x in x0k:x1k) {
         rn <- cols[[x]]
-        if (is.null(rn) || nrow(rn) != 1L) next
-        h <- rn[1, "bot"] - rn[1, "top"] + 1L
-        c_ <- (rn[1, "top"] + rn[1, "bot"]) / 2
-        if (h <= Tk + 2L && c_ >= up + half + 3L && c_ <= lo - half - 3L) {
-          fx_ <- c(fx_, x); flev <- c(flev, c_)
+        if (is.null(rn)) next
+        for (r in seq_len(nrow(rn))) {
+          top <- rn[r, "top"]; bot <- rn[r, "bot"]
+          h <- bot - top + 1L
+          if (h < Tk - 2L || h > Tk + 2L) next
+          if (!(top > up + half && bot < lo - half)) next
+          ev <- rbind(ev, data.frame(x = x, lev = (top + bot) / 2))
         }
       }
-      if (length(fx_) >= 3L) {
-        # the largest cluster of near-equal-level plain columns is the plateau
-        o <- order(flev); fx_ <- fx_[o]; flev <- flev[o]
-        grp <- cumsum(c(1L, abs(diff(flev)) > 2))
-        best <- which.max(tabulate(grp))
-        sel <- grp == best
-        if (sum(sel) >= 3L)
-          arm <- list(x = sort(fx_[sel]), lev = stats::median(flev[sel]))
+      if (nzchar(Sys.getenv("KMX_DEBUG")) && nrow(ev)) {
+        cat(sprintf("[split] riser %d t=%.2f window x %d-%d levels %.1f->%.1f Tk=%d\n",
+                    k, riser_t[k], x0k, x1k, up, lo, Tk)); print(ev)
+      }
+      if (nrow(ev)) {
+        ev <- ev[order(ev$lev, ev$x), ]
+        cl <- cumsum(c(1L, diff(ev$lev) > max(4, Tk / 2)))
+        levs <- list()
+        for (ci in unique(cl)) {
+          e <- ev[cl == ci, ]
+          xs <- sort(unique(e$x))
+          runs <- split(xs, cumsum(c(1L, diff(xs) > 1L)))
+          if (max(vapply(runs, length, 0L)) >= 2L)
+            levs[[length(levs) + 1L]] <- data.frame(level_px = stats::median(e$lev),
+                                                    x0 = min(xs), x1 = max(xs),
+                                                    n_plain = length(xs))
+        }
+        if (length(levs)) {
+          levels <- do.call(rbind, levs)
+          levels <- levels[order(levels$level_px), , drop = FALSE]
+          # levels must descend left to right, and fit the anchors
+          if (nrow(levels) > 1L && any(diff(levels$x0) <= 0)) levels <- NULL
+          if (!is.null(levels) && nrow(levels) > spare[j]) levels <- NULL
+        }
       }
     }
-    if (!is.null(arm)) {
-      # envelope jumps locate the two sub-risers (de-biased by half a width)
-      xs <- x0k:x1k
-      tops <- vapply(xs, function(x) {
-        rn <- cols[[x]]
-        if (is.null(rn)) return(NA_real_)
-        i <- which(rn[, "bot"] >= up - half & rn[, "top"] <= lo + half &
-                   rn[, "top"] >= up - half - 1L)
-        if (!length(i)) return(NA_real_)
-        min(rn[i, "top"])
-      }, 0)
-      env <- up - half
-      for (i in seq_along(tops)) {
-        if (!is.na(tops[i]) && tops[i] > env) env <- tops[i]
-        tops[i] <- env
+    if (!is.null(levels)) {
+      spare[j] <- spare[j] - nrow(levels)
+      lev_seq <- c(up, levels$level_px, lo)
+      xl_seq <- c(x0k, levels$x1 + 1L)      # each sub-riser's search window
+      xh_seq <- c(levels$x0 - 1L, x1k)
+      for (q in seq_len(nrow(levels) + 1L)) {
+        rx <- .kmx_riser_x(cols, xl_seq[q], xh_seq[q], lev_seq[q], lev_seq[q + 1L], Tk)
+        new_ris <- rbind(new_ris, data.frame(x_px = rx$x, width = rx$width, hidden = rx$hidden))
+        if (q <= nrow(levels))
+          new_plat <- rbind(new_plat, levels[q, c("level_px", "x0", "x1", "n_plain")])
       }
-      iA <- which(tops > up + half)[1]
-      iB <- which(tops > arm$lev + half)[1]
-      xA <- if (!is.na(iA)) xs[max(1L, iA - half - 2L)] else (x0k + min(arm$x)) / 2
-      xB <- if (!is.na(iB)) xs[max(1L, iB - half - 2L)] else (max(arm$x) + x1k) / 2
-      if (xB <= xA + 1L) xB <- xA + 2L
-      new_ris <- rbind(new_ris, data.frame(x_px = xA, width = 0L, hidden = FALSE))
-      new_plat <- rbind(new_plat, data.frame(level_px = arm$lev, x0 = min(arm$x),
-                                             x1 = max(arm$x), n_plain = 0L))
-      new_ris <- rbind(new_ris, data.frame(x_px = xB, width = 0L, hidden = FALSE))
       new_plat <- rbind(new_plat, plat[k + 1L, , drop = FALSE])
     } else {
       new_ris <- rbind(new_ris, risers[k, , drop = FALSE])
       new_plat <- rbind(new_plat, plat[k + 1L, , drop = FALSE])
     }
   }
-  plat <- new_plat; risers <- new_ris
-  rownames(plat) <- NULL; rownames(risers) <- NULL
-  stopifnot(all(diff(plat$level_px) > 0))
-  # end of curve: last column with ink (marks included)
-  x_last <- max(which(!vapply(cols, is.null, TRUE)))
-  list(plateaus = plat, risers = risers, T = Tk, cols = cols,
-       x_last = x_last, r0 = r0, r1 = r1)
+  rownames(new_plat) <- NULL; rownames(new_ris) <- NULL
+  stopifnot(all(diff(new_plat$level_px) > 0), all(diff(new_ris$x_px) > 0))
+  path$plateaus <- new_plat; path$risers <- new_ris
+  path
 }
 
 # ---------------------------------------------------------------------------
@@ -200,11 +226,6 @@ if (!exists(".km_find_axes")) stop("source R/km_extract.R before this file")
   R <- nrow(ris)
   for (k in seq_len(nrow(plat))) {
     lvl <- plat$level_px[k]
-    if (plat$n_plain[k] == 0L) {
-      # arm-evidence mini plateau: the defining arm IS the censor mark
-      add(k - 1L, (plat$x0[k] + plat$x1[k]) / 2, "D")
-      next
-    }
     # --- channel A: symmetric protrusion, scanned over the full gap span ----
     # (a mark at the plateau edge sits beyond the last clean column; riser
     # strokes self-exclude: their top never clears the level by the margin)
@@ -524,6 +545,7 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
   mask[axes$x_top:nrow(mask), ] <- FALSE
   y_top_px <- ticks$y_px[which.max(y_ticks)]
   path <- .kmx_path(mask, axes, y_top_px)
+  path <- .kmx_split_risers(path, anchors, to_t)
   plat <- path$plateaus
   # sanity: the first plateau is S = 1
   stopifnot("exact mode: first plateau is not at S = 1" =
@@ -593,8 +615,13 @@ km_extract_exact <- function(image_path, x_ticks, anchors,
   pick <- seq_along(sv$solutions)
   sampled <- length(pick) > keep_max
   if (sampled) {
+    # reproducible subsample WITHOUT clobbering the caller's RNG stream
+    had_seed <- exists(".Random.seed", envir = .GlobalEnv)
+    if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv)
     set.seed(1L)
     pick <- sort(sample(pick, keep_max))
+    if (had_seed) assign(".Random.seed", old_seed, envir = .GlobalEnv) else
+      rm(".Random.seed", envir = .GlobalEnv)
     warning("exact mode: ", length(sv$solutions), " solutions - statistics ",
             "beyond the events bounds are computed on a sample of ", keep_max)
   }
